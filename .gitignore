@@ -1,0 +1,8 @@
+__pycache__/
+*.pth
+*.pt
+weights/
+datasets/
+output/
+debug_*.jpg
+*_result.jpg
