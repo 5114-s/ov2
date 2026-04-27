@@ -1,0 +1,1 @@
+/data/ZhaoX/LabelAny3D-main/LabelAny3D-main/external/ml-depth-pro/get_pretrained_models.sh

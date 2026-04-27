@@ -1,19 +1,18 @@
 #!/bin/bash
 
-# Usage: bash scripts/generate_pseudo_label.sh <DATASET> [SKIP_STEPS]
-# SKIP_STEPS: comma-separated list of steps to skip, e.g. "1,2" skips steps 1 and 2
-#   Step 1: Depth prediction (UniDepth)
-#   Step 2: Segmentation (Grounded-SAM)
-#   Step 3: Generate 3D pseudo bboxes
-#   Step 4: Convert to COCO format
+# Usage: bash scripts/generate_pseudo_label.sh <DATASET> [SKIP_STEPS] [DEPTH_METHOD]
+# DEPTH_METHOD: unidepth (default) | moge_depthpro
 
 DATASET=$1
 SKIP_STEPS=${2:-""}
+DEPTH_METHOD=${3:-"unidepth"}
 
 if [ -z "$DATASET" ]; then
-    echo "Usage: bash scripts/generate_pseudo_label.sh <DATASET> [SKIP_STEPS]"
+    echo "Usage: bash scripts/generate_pseudo_label.sh <DATASET> [SKIP_STEPS] [DEPTH_METHOD]"
     echo "  e.g.: bash scripts/generate_pseudo_label.sh SUNRGBD"
     echo "  e.g.: bash scripts/generate_pseudo_label.sh SUNRGBD 1,2"
+    echo "  e.g.: bash scripts/generate_pseudo_label.sh SUNRGBD '' moge_depthpro"
+    echo "  DEPTH_METHOD: unidepth (default) | moge_depthpro"
     exit 1
 fi
 
@@ -32,10 +31,15 @@ should_skip() {
 eval "$(~/miniconda3/bin/conda shell.bash hook)"
 conda activate ovm3d-1
 
-# Step 1: Predict depth using UniDepth
+# Step 1: Predict depth
 if ! should_skip 1; then
-    echo "=== Step 1: Depth prediction (UniDepth) ==="
-    CUDA_VISIBLE_DEVICES=0 python third_party/UniDepth/run_unidepth.py --dataset $DATASET
+    if [ "$DEPTH_METHOD" = "moge_depthpro" ]; then
+        echo "=== Step 1: Depth prediction (MoGe+DepthPro fusion) ==="
+        CUDA_VISIBLE_DEVICES=0 python third_party/fused_depth/run_fused_depth.py --dataset $DATASET
+    else
+        echo "=== Step 1: Depth prediction (UniDepth) ==="
+        CUDA_VISIBLE_DEVICES=0 python third_party/UniDepth/run_unidepth.py --dataset $DATASET
+    fi
 else
     echo "=== Step 1: Skipped ==="
 fi
@@ -51,8 +55,8 @@ fi
 
 # Step 3: Generate pseudo 3D bounding boxes
 if ! should_skip 3; then
-    echo "=== Step 3: Generate 3D pseudo bboxes (hybrid) ==="
-    YAW_METHOD=hybrid python tools/generate_pseudo_bbox.py \
+    echo "=== Step 3: Generate 3D pseudo bboxes (pca) ==="
+    YAW_METHOD=pca python tools/generate_pseudo_bbox.py \
       --config-file configs/Base_Omni3D_${CONFIG_NAME}.yaml \
       OUTPUT_DIR output/generate_pseudo_label/$DATASET
 else
