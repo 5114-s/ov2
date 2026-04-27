@@ -49,8 +49,17 @@ def main(dataset_name):
                     center_cam = info[im_id]["center_cam"]
                     dimension = info[im_id]["dimensions"]
                     R_cam = info[im_id]["R_cam"]
+                    bbox2d_tight_list = info[im_id].get("bbox2d_tight", None)
                     
                     for j in range(len(cat)):
+                        cz = center_cam[j][2]
+                        h, w, l = dimension[j]
+                        # Filter extreme z values and dimensions
+                        if cz <= 0.1 or cz > 8.0:
+                            continue
+                        if h <= 0.05 or h > 3.0 or w <= 0.05 or w > 5.0 or l <= 0.05 or l > 5.0:
+                            continue
+
                         obj = {}
                         obj['id'] = dataset_id * 10000000 + num
                         obj['image_id'] = im_id
@@ -59,8 +68,11 @@ def main(dataset_name):
                         obj['category_id'] = thing_classes[cat[j]]
 
                         obj['valid3D'] = True
-                        obj['bbox2D_tight'] = [-1,-1,-1,-1]
-                        obj['bbox2D_trunc'] = [-1,-1,-1,-1]
+                        if bbox2d_tight_list is not None and bbox2d_tight_list[j] != [-1, -1, -1, -1]:
+                            obj['bbox2D_tight'] = [float(x) for x in bbox2d_tight_list[j]]
+                        else:
+                            obj['bbox2D_tight'] = [-1, -1, -1, -1]
+                        obj['bbox2D_trunc'] = [-1, -1, -1, -1]
                         obj['bbox2D_proj'] = bbox[j].tolist()
                         obj['bbox3D_cam'] = bbox3D[j].tolist()
                         obj['center_cam'] = center_cam[j].tolist()

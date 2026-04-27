@@ -52,6 +52,7 @@ from cubercnn.generate_label import llm_generated_prior
 import cubercnn.vis.logperf as utils_logperf
 
 MAX_TRAINING_ATTEMPTS = 10
+YAW_METHOD_DEFAULT = "pca"
 
 
 def generate_pseudo_label(cfg):
@@ -71,7 +72,7 @@ def generate_pseudo_label(cfg):
 
         if dataset in ['SUNRGBD', 'ARKitScenes']: # indoor datasets
             generate_label.process_indoor(
-            data_loader.dataset, cat_prior, input_folder, output_folder
+            data_loader.dataset, cat_prior, input_folder, output_folder, yaw_method=os.environ.get("YAW_METHOD", YAW_METHOD_DEFAULT)
         )
         else:  # outdoor datasets
             generate_label.process_outdoor(
