@@ -60,9 +60,10 @@ def moge_worker(device_id: int, task_queue: mp.Queue, result_queue: mp.Queue,
         try:
             out = loader.infer(rgb)
             depth = out["depth"].astype(np.float32)
-            result_queue.put((img_id, depth, None))
+            mask = out.get("mask", None)
+            result_queue.put((img_id, depth, mask, None))
         except Exception as e:
-            result_queue.put((img_id, None, str(e)))
+            result_queue.put((img_id, None, None, str(e)))
 
 
 def depthpro_worker(device_id: int, task_queue: mp.Queue, result_queue: mp.Queue,
@@ -93,63 +94,61 @@ def depthpro_worker(device_id: int, task_queue: mp.Queue, result_queue: mp.Queue
         try:
             out = loader.infer(rgb, focal_length_px=focal_length_px)
             depth = out["depth"].astype(np.float32)
-            result_queue.put((img_id, depth, None))
+            result_queue.put((img_id, depth, None, None))  # DepthPro doesn't return mask
         except Exception as e:
-            result_queue.put((img_id, None, str(e)))
+            result_queue.put((img_id, None, None, str(e)))
 
 
 # --------------------------------------------------------------------------- #
-# RANSAC alignment (same as moge_depthpro_fusion.py)
+# RANSAC alignment (same as LabelAny3D original: fit_intercept=True)
 # --------------------------------------------------------------------------- #
 def align_depth_ransac(relative_depth, metric_depth, mask=None, verbose=False):
+    from sklearn.linear_model import RANSACRegressor, LinearRegression
+
     rel = np.asarray(relative_depth, dtype=np.float64).flatten()
     met = np.asarray(metric_depth, dtype=np.float64).flatten()
 
-    valid = np.isfinite(rel) & np.isfinite(met) & (rel > 0) & (met > 0)
+    # Same as LabelAny3D: only check inf for relative depth
+    valid = (~np.isinf(rel)) & (met < 400.0)
     if mask is not None:
         m = np.asarray(mask, dtype=bool).flatten()
         valid = valid & m
 
-    rel_v = rel[valid].reshape(-1, 1)
-    met_v = met[valid].reshape(-1, 1)
-
     if valid.sum() == 0:
-        return metric_depth.astype(np.float32), {"scale": 1.0, "status": "failed"}
+        print("Warning: No valid points for alignment. Returning metric depth.")
+        return metric_depth.astype(np.float32), {"status": "failed"}
 
-    if len(rel_v) < 100:
-        scale = met_v.mean() / (rel_v.mean() + 1e-6)
-        depth = np.full_like(relative_depth, 10000.0)
-        depth.flat[valid] = rel.flat[valid] * scale
-        return depth.astype(np.float32), {"scale": float(scale), "status": "warning"}
-
-    from sklearn.linear_model import RANSACRegressor, LinearRegression
-    ransac = RANSACRegressor(
-        estimator=LinearRegression(fit_intercept=False),
-        min_samples=0.2,
-        random_state=42,
-    )
     try:
-        ransac.fit(rel_v, met_v)
-        scale = ransac.estimator_.coef_[0, 0]
-        inlier_mask = ransac.inlier_mask_
-    except Exception:
-        scale = met_v.mean() / (rel_v.mean() + 1e-6)
-        depth = np.full_like(relative_depth, 10000.0)
-        depth.flat[valid] = rel.flat[valid] * scale
-        return depth.astype(np.float32), {"scale": float(scale), "status": "warning"}
+        regressor = RANSACRegressor(
+            estimator=LinearRegression(fit_intercept=False),
+            min_samples=0.2,
+            random_state=42,
+        )
+        regressor.fit(rel[valid].reshape(-1, 1), met[valid].reshape(-1, 1))
+    except Exception as e:
+        print(f"Error fitting RANSACRegressor: {e}, using metric depth directly")
+        return metric_depth.astype(np.float32), {"status": "failed"}
 
-    if not np.isfinite(scale) or scale <= 0:
-        scale = met_v.mean() / (rel_v.mean() + 1e-6)
-        depth = np.full_like(relative_depth, 10000.0)
-        depth.flat[valid] = rel.flat[valid] * scale
-        return depth.astype(np.float32), {"scale": float(scale), "status": "warning"}
+    # Initialize output depth array with large values (same as LabelAny3D)
+    depth = np.full_like(rel, 10000.0)
 
-    depth = np.full_like(relative_depth, 10000.0)
-    depth.flat[valid] = rel.flat[valid] * scale
-    inlier_ratio = float(inlier_mask.sum() / len(rel_v))
+    # Only predict for masked/valid regions (same as LabelAny3D)
+    if mask is not None:
+        masked_pred = regressor.predict(rel[valid].reshape(-1, 1)).flatten()
+        depth[valid] = masked_pred
+    else:
+        valid_mask = ~np.isinf(rel)
+        masked_pred = regressor.predict(rel[valid_mask].reshape(-1, 1)).flatten()
+        depth[valid_mask] = masked_pred
+
+    inlier_ratio = float(regressor.inlier_mask_.sum() / len(regressor.inlier_mask_)) if hasattr(regressor, 'inlier_mask_') and regressor.inlier_mask_ is not None else 0.0
     if verbose:
-        print(f">> [RANSAC] scale={scale:.4f}, inliers={inlier_ratio:.1%}")
-    return depth.astype(np.float32), {"scale": float(scale), "status": "success"}
+        scale = regressor.estimator_.coef_[0, 0] if hasattr(regressor.estimator_, 'coef_') else 1.0
+        intercept = regressor.estimator_.intercept_ if hasattr(regressor.estimator_, 'intercept_') else 0.0
+        print(f">> [RANSAC] scale={scale:.4f}, intercept={intercept:.4f}, inliers={inlier_ratio:.1%}")
+
+    H, W = relative_depth.shape[-2], relative_depth.shape[-1]
+    return depth.reshape(H, W).astype(np.float32), {"status": "success"}
 
 
 # --------------------------------------------------------------------------- #
@@ -221,8 +220,8 @@ def process(args):
         pbar = tqdm(total=len(data["images"]), desc=f"{dataset}_{mode}")
 
         # Track pending results: img_id -> (rgb, K)
-        pending = {}   # img_id -> dict with rgb, K, submitted_moge, submitted_dp
-        results_moge = {}  # img_id -> depth
+        pending = {}   # img_id -> dict with rgb, K, out_path
+        results_moge = {}  # img_id -> (depth, mask)
         results_dp = {}    # img_id -> depth
 
         i = 0
@@ -253,7 +252,7 @@ def process(args):
 
             # Collect results
             try:
-                img_id, depth, err = result_queue.get(timeout=60)
+                img_id, depth, mask, err = result_queue.get(timeout=60)
             except Empty:
                 continue
 
@@ -265,10 +264,12 @@ def process(args):
                 pbar.update(1)
                 continue
 
-            # Determine which model returned
-            if img_id not in results_moge:
-                results_moge[img_id] = depth
+            # Determine which model returned (4th element is None for DepthPro, not None for MoGe)
+            if mask is not None:
+                # This is MoGe result with mask
+                results_moge[img_id] = (depth, mask)
             elif img_id not in results_dp:
+                # This is DepthPro result
                 results_dp[img_id] = depth
             else:
                 continue  # duplicate, ignore
@@ -276,8 +277,9 @@ def process(args):
             # If both results are ready, fuse and save
             if img_id in results_moge and img_id in results_dp and img_id in pending:
                 info = pending[img_id]
+                moge_depth, moge_mask = results_moge[img_id]
                 depth_fused, diag = align_depth_ransac(
-                    results_moge[img_id], results_dp[img_id], verbose=False
+                    moge_depth, results_dp[img_id], mask=moge_mask, verbose=False
                 )
                 np.save(info["out_path"], depth_fused)
                 del pending[img_id]

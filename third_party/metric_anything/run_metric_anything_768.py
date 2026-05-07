@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""
+MetricAnything depth estimation with 768x768 resolution to avoid OOM.
+"""
+
+import torch
+import torch.nn as nn
+import numpy as np
+import os
+import sys
+import types
+from PIL import Image
+from tqdm import tqdm
+import json
+import argparse
+import torch.nn.functional as F
+from torchvision.transforms import v2
+import gc
+import math
+
+torch.backends.cudnn.enabled = False
+
+script_dir = os.path.dirname(os.path.abspath(__file__))
+os.chdir(script_dir)
+sys.path.insert(0, '.')
+sys.path.insert(0, './network')
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--root', type=str, default='/data/ZhaoX/OVM3D-Det')
+    parser.add_argument('--json-dir', type=str, default='datasets/Omni3D_pl-1')
+    parser.add_argument('--dataset', type=str, default='SUNRGBD')
+    parser.add_argument('--pretrained', type=str, default='yjh001/metricanything_student_depthmap')
+    parser.add_argument('--gpu', type=int, default=0)
+    parser.add_argument('--start', type=int, default=0)
+    parser.add_argument('--end', type=int, default=-1)
+    parser.add_argument('--resolution', type=int, default=768)
+    return parser.parse_args()
+
+
+def create_backbone():
+    from network.vit_factory import VIT_CONFIG_DICT
+    from dinov3.hub.backbones import dinov3_vith16plus
+
+    preset = 'dinov3_vith16plus_224'
+    config = VIT_CONFIG_DICT[preset]
+
+    model = dinov3_vith16plus(pretrained=False, weights=None)
+    model.patch_embed.img_size = (config.img_size, config.img_size)
+
+    original = model.forward_features
+
+    def forward_with_cls(self, x, is_training=False, **kwargs):
+        feats = original(x)
+        cls_token = feats['x_norm_clstoken'].unsqueeze(1)
+        patch_tokens = feats['x_norm_patchtokens']
+        return torch.cat([cls_token, patch_tokens], dim=1)
+
+    model.forward = types.MethodType(forward_with_cls, model)
+    model.start_index = 1
+    model.patch_size = model.patch_embed.patch_size
+    model.is_vit = True
+
+    return model
+
+
+def create_model():
+    from network.encoder import MetricAnythingEncoder
+    from network.decoder import MultiresConvDecoder
+
+    hook_block_ids = [7, 13, 19, 25]
+    encoder_feature_dims = [320, 256, 320, 640]
+    decoder_features = 256
+    patch_size = 384
+
+    backbone = create_backbone()
+    encoder = MetricAnythingEncoder(
+        dims_encoder=encoder_feature_dims,
+        patch_encoder=backbone,
+        hook_block_ids=hook_block_ids,
+    )
+
+    # Monkey-patch split to handle any size
+    original_split = encoder.split
+    def patched_split(x, overlap_ratio=0.25):
+        return original_split(x, overlap_ratio)
+    encoder.split = patched_split
+
+    decoder_dims = [decoder_features] + [encoder.dims_encoder[0]] * 2 + list(encoder.dims_encoder)
+    decoder = MultiresConvDecoder(dims_encoder=decoder_dims, dim_decoder=decoder_features)
+
+    model = MetricAnythingModelWrapper(encoder, decoder, patch_size)
+    return model
+
+
+class MetricAnythingModelWrapper(nn.Module):
+    def __init__(self, encoder, decoder, patch_size=384):
+        super().__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        self.patch_size = patch_size
+        self.head = self._build_head(decoder.dim_decoder)
+
+    def _build_head(self, dim_decoder):
+        last_dims = (32, 1)
+        layers = [
+            nn.Conv2d(dim_decoder, dim_decoder // 2, kernel_size=3, stride=1, padding=1),
+            nn.ConvTranspose2d(dim_decoder // 2, dim_decoder // 2, kernel_size=2, stride=2, padding=0, bias=True),
+            nn.Conv2d(dim_decoder // 2, last_dims[0], kernel_size=3, stride=1, padding=1),
+            nn.ReLU(inplace=True),
+        ]
+        for _ in range(4):
+            layers += [nn.Conv2d(last_dims[0], last_dims[0], kernel_size=3, stride=1, padding=1), nn.ReLU(inplace=True)]
+        layers += [nn.Conv2d(last_dims[0], last_dims[1], kernel_size=1, stride=1, padding=0), nn.ReLU(inplace=True)]
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        encodings = self.encoder(x)
+        features, _ = self.decoder(encodings)
+        return self.head(features)
+
+    @torch.no_grad()
+    def infer(self, x, orig_size, f_px, resolution=768, interpolation_mode="bilinear"):
+        if x.ndim == 3:
+            x = x.unsqueeze(0)
+
+        orig_h, orig_w = orig_size
+
+        # Resize to target resolution
+        x = F.interpolate(x, size=(resolution, resolution), mode=interpolation_mode, align_corners=False)
+        canonical_inverse_depth = self.forward(x)
+
+        if f_px is None:
+            f_px = 1000.0
+
+        # Scale focal length
+        scale = max(orig_h, orig_w) / resolution
+        f_px_scaled = f_px / scale
+        inverse_depth = canonical_inverse_depth * (resolution / f_px_scaled)
+
+        # Resize back
+        inverse_depth = F.interpolate(inverse_depth, size=(orig_h, orig_w), mode=interpolation_mode, align_corners=False)
+        depth = 1.0 / torch.clamp(inverse_depth, min=1e-3, max=1e3)
+        return {"depth": depth.squeeze()}
+
+
+def make_transform():
+    return v2.Compose([
+        v2.ToImage(),
+        v2.ToDtype(torch.float32, scale=True),
+        v2.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+    ])
+
+
+def main():
+    args = parse_args()
+
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
+    device = torch.device('cuda:0')
+
+    print(f"Loading model on GPU 0 (physically GPU {args.gpu}) at {args.resolution}x{args.resolution}...")
+
+    from huggingface_hub import hf_hub_download
+    checkpoint_path = hf_hub_download(repo_id=args.pretrained, repo_type="model", filename="student_depthmap.pt")
+
+    model = create_model().to(device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+        checkpoint = checkpoint["state_dict"]
+    model.load_state_dict(checkpoint, strict=True)
+    model.eval()
+    print(f"Model loaded!")
+
+    transform = make_transform()
+
+    json_dir = os.path.join(args.root, args.json_dir)
+    out_base = os.path.join(args.root, f'pseudo_label-{args.dataset}')
+
+    for mode in ['train', 'val']:
+        json_path = os.path.join(json_dir, f'{args.dataset}_{mode}.json')
+        if not os.path.exists(json_path):
+            continue
+
+        with open(json_path, 'r') as f:
+            data = json.load(f)
+
+        outdir = os.path.join(out_base, mode, 'depth')
+        os.makedirs(outdir, exist_ok=True)
+
+        start_idx = args.start
+        end_idx = args.end if args.end > 0 else len(data['images'])
+
+        images_to_process = []
+        for i in range(start_idx, min(end_idx, len(data['images']))):
+            image_info = data['images'][i]
+            file_name = image_info['id']
+            out_path = os.path.join(outdir, f"{file_name}.npy")
+            if os.path.exists(out_path):
+                continue
+            images_to_process.append((i, image_info))
+
+        if not images_to_process:
+            print(f"{mode}: no images to process in range [{start_idx}, {end_idx})")
+            continue
+
+        print(f"\n{mode}: GPU {args.gpu} processing {len(images_to_process)} images at {args.resolution}x{args.resolution}")
+
+        for i, image_info in tqdm(images_to_process, desc=f"GPU {args.gpu} {mode}"):
+            filename = image_info['file_path']
+            file_name = image_info['id']
+            image_path = os.path.join(args.root, 'datasets', filename)
+
+            try:
+                image = Image.open(image_path).convert('RGB')
+                orig_w, orig_h = image.size
+
+                input_tensor = transform(image).unsqueeze(0).to(device)
+                intrinsics = np.array(image_info['K']).reshape(3, 3)
+                f_px = float(intrinsics[0, 0])
+
+                prediction = model.infer(input_tensor, orig_size=(orig_h, orig_w), f_px=f_px, resolution=args.resolution)
+                depth = prediction["depth"].detach().cpu().numpy().squeeze()
+
+                out_path = os.path.join(outdir, f"{file_name}.npy")
+                np.save(out_path, depth)
+
+                del image, input_tensor, prediction, depth
+                gc.collect()
+            except Exception as e:
+                print(f"\nError processing {filename}: {e}")
+                gc.collect()
+
+    print("\nDone!")
+
+
+if __name__ == "__main__":
+    main()

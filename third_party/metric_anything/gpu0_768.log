@@ -1,0 +1,9 @@
+Loading model on GPU 0 (physically GPU 0) at 768x768...
+Traceback (most recent call last):
+  File "/data/ZhaoX/OVM3D-Det/third_party/metric_anything/run_metric_anything_768.py", line 238, in <module>
+    main()
+  File "/data/ZhaoX/OVM3D-Det/third_party/metric_anything/run_metric_anything_768.py", line 167, in main
+    model = create_model().to(device)
+  File "/data/ZhaoX/OVM3D-Det/third_party/metric_anything/run_metric_anything_768.py", line 69, in create_model
+    from network.encoder import MetricAnythingEncoder
+ModuleNotFoundError: No module named 'network'
