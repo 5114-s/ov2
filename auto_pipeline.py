@@ -9,6 +9,7 @@ import sys
 import time
 import subprocess
 import signal
+import argparse
 
 # Configuration
 ROOT = "/data/ZhaoX/OVM3D-Det"
@@ -118,11 +119,46 @@ def monitor_and_run():
     print("\n" + "="*60)
     print("Starting Step 3: Generate 3D pseudo bboxes")
     print("="*60)
-    
-    run_command(
-        "YAW_METHOD=pca python tools/generate_pseudo_bbox.py --config-file configs/Base_Omni3D_SUN.yaml OUTPUT_DIR output/generate_pseudo_label/SUNRGBD",
-        "Step 3: Generate 3D pseudo bboxes (PCA)"
-    )
+
+    # Choose yaw method based on environment variable
+    yaw_method = os.environ.get("YAW_METHOD", "pca")
+    print(f">> Using yaw estimation method: {yaw_method}")
+
+    # Set up image folder for MASt3R/TRELLIS
+    image_folder = os.path.join(ROOT, "data/SUNRGBD/images")
+    if not os.path.exists(image_folder):
+        image_folder = None
+
+    if yaw_method == "mast3r_trellis":
+        # Use TRELLIS for 3D model generation (best quality)
+        run_command(
+            "YAW_METHOD=mast3r_trellis python tools/generate_pseudo_bbox.py --config-file configs/Base_Omni3D_SUN.yaml OUTPUT_DIR output/generate_pseudo_label/SUNRGBD",
+            "Step 3: Generate 3D pseudo bboxes (TRELLIS + MASt3R)"
+        )
+    elif yaw_method == "mast3r_trellis_hybrid":
+        # Use TRELLIS with L-Shape fallback
+        run_command(
+            "YAW_METHOD=mast3r_trellis_hybrid python tools/generate_pseudo_bbox.py --config-file configs/Base_Omni3D_SUN.yaml OUTPUT_DIR output/generate_pseudo_label/SUNRGBD",
+            "Step 3: Generate 3D pseudo bboxes (TRELLIS + MASt3R + Hybrid)"
+        )
+    elif yaw_method == "mast3r":
+        # Use MASt3R with pointcloud rendering
+        run_command(
+            "YAW_METHOD=mast3r python tools/generate_pseudo_bbox.py --config-file configs/Base_Omni3D_SUN.yaml OUTPUT_DIR output/generate_pseudo_label/SUNRGBD",
+            "Step 3: Generate 3D pseudo bboxes (MASt3R)"
+        )
+    elif yaw_method == "labelany3d":
+        # Use EXACT LabelAny3D pipeline (TRELLIS + MASt3R + Two-stage PnP)
+        run_command(
+            "YAW_METHOD=labelany3d python tools/generate_pseudo_bbox.py --config-file configs/Base_Omni3D_SUN.yaml OUTPUT_DIR output/generate_pseudo_label/SUNRGBD",
+            "Step 3: Generate 3D pseudo bboxes (LabelAny3D - TRELLIS + MASt3R + Two-stage PnP)"
+        )
+    else:
+        # Default: PCA or other methods
+        run_command(
+            f"YAW_METHOD={yaw_method} python tools/generate_pseudo_bbox.py --config-file configs/Base_Omni3D_SUN.yaml OUTPUT_DIR output/generate_pseudo_label/SUNRGBD",
+            f"Step 3: Generate 3D pseudo bboxes ({yaw_method})"
+        )
     
     # Step 4: Convert to COCO format
     print("\n" + "="*60)

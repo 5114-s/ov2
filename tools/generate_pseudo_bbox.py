@@ -56,6 +56,8 @@ YAW_METHOD_DEFAULT = "pca"
 
 
 def generate_pseudo_label(cfg):
+    start_idx = int(os.environ.get("START_IDX", "0"))
+    end_idx = int(os.environ.get("END_IDX", "0"))  # 0 means no limit
 
     dataset_names = cfg.DATASETS.TRAIN
 
@@ -63,16 +65,21 @@ def generate_pseudo_label(cfg):
 
         dataset, mode = dataset_name.split('_')
         input_folder = f'pseudo_label/{dataset}/{mode}'
+        image_folder = f'datasets/SUNRGBD'
         output_folder = os.path.join(cfg.OUTPUT_DIR, dataset, mode)
 
         data_loader = build_detection_test_loader(cfg, dataset_name)
-        
+
         # import the llm-generated priors for the dataset
         cat_prior = llm_generated_prior[dataset]
 
         if dataset in ['SUNRGBD', 'ARKitScenes']: # indoor datasets
             generate_label.process_indoor(
-            data_loader.dataset, cat_prior, input_folder, output_folder, yaw_method=os.environ.get("YAW_METHOD", YAW_METHOD_DEFAULT)
+            data_loader.dataset, cat_prior, input_folder, output_folder,
+            yaw_method=os.environ.get("YAW_METHOD", YAW_METHOD_DEFAULT),
+            image_folder=image_folder,
+            start_idx=start_idx,
+            end_idx=end_idx if end_idx > 0 else None
         )
         else:  # outdoor datasets
             generate_label.process_outdoor(
